@@ -161,7 +161,7 @@ EOF
 # ============ 2. 硬件直通 ============
 enable_pass() {
     log_step "开启硬件直通..."
-    if [ $(dmesg | grep -ce DMAR -e IOMMU | wc -l) = 0 ]; then
+    if [ $(dmesg | grep -ce 'DMAR\|IOMMU') = 0 ]; then
         log_error "您的硬件不支持直通！"
         return 1
     fi
@@ -836,6 +836,534 @@ remove_kernel() {
     log_success "清理和 GRUB 更新完成"
 }
 
+# ============ 10. 合并 local 存储 ============
+merge_local_storage() {
+    log_step "准备合并存储空间，让小硬盘发挥最大价值"
+    log_warn "此操作会删除 local-lvm，请确保重要数据已备份！"
+    read -p "输入 'yes' 确认继续，其他任意键取消: " -r
+    if [[ ! $REPLY == "yes" ]]; then
+        log_info "操作已取消"
+        return
+    fi
+    if ! lvdisplay /dev/pve/data &> /dev/null; then
+        log_warn "没有找到 local-lvm 分区，可能已经合并过了"
+        return
+    fi
+    log_info "正在删除 local-lvm 分区..."
+    lvremove -f /dev/pve/data
+    log_info "正在扩容 local 分区..."
+    lvextend -l +100%FREE /dev/pve/root
+    log_info "正在扩展文件系统..."
+    resize2fs /dev/pve/root
+    log_success "存储合并完成！"
+    log_warn "请在 Web UI 中删除 local-lvm 存储配置，并编辑 local 存储勾选所有内容类型"
+}
+
+# ============ 11. 删除 Swap ============
+remove_swap() {
+    log_step "准备释放 Swap 空间给系统使用"
+    log_warn "删除 Swap 后请确保内存充足！"
+    read -p "输入 'yes' 确认继续，其他任意键取消: " -r
+    if [[ ! $REPLY == "yes" ]]; then
+        log_info "操作已取消"
+        return
+    fi
+    if ! lvdisplay /dev/pve/swap &> /dev/null; then
+        log_warn "没有找到 swap 分区，可能已经删除过了"
+        return
+    fi
+    log_info "正在关闭 Swap..."
+    swapoff /dev/mapper/pve-swap
+    log_info "正在修改启动配置..."
+    backup_file "/etc/fstab"
+    sed -i 's|^/dev/pve/swap|# /dev/pve/swap|g' /etc/fstab
+    log_info "正在删除 swap 分区..."
+    lvremove -f /dev/pve/swap
+    log_info "正在扩展系统分区..."
+    lvextend -l +100%FREE /dev/mapper/pve-root
+    log_info "正在扩展文件系统..."
+    resize2fs /dev/mapper/pve-root
+    log_success "Swap 删除完成！系统空间更宽裕了"
+}
+
+# ============ 12. 邮件通知配置 ============
+pve_mail_setup() {
+    log_step "配置 PVE 邮件通知（SMTP）"
+
+    if ! command -v postfix >/dev/null 2>&1; then
+        log_warn "未检测到 postfix，正在安装..."
+        apt-get install -y postfix mailutils libsasl2-modules
+    fi
+
+    local from_addr root_addr
+    read -p "请输入发件人邮箱: " from_addr
+    [[ -z "$from_addr" ]] && { log_error "发件人邮箱不能为空"; return 1; }
+    read -p "请输入 root 通知邮箱（收件人）: " root_addr
+    [[ -z "$root_addr" ]] && { log_error "收件人邮箱不能为空"; return 1; }
+
+    echo "请选择 SMTP 预设："
+    echo "  1) QQ 邮箱（smtp.qq.com:465 SSL）"
+    echo "  2) 163 邮箱（smtp.163.com:465 SSL）"
+    echo "  3) Gmail（smtp.gmail.com:587 STARTTLS）"
+    echo "  4) 自定义"
+    read -p "请选择 [1-4, 默认1]: " preset
+    preset=${preset:-1}
+
+    local smtp_host smtp_port tls_mode
+    case "$preset" in
+        1) smtp_host="smtp.qq.com"; smtp_port="465"; tls_mode="wrapper" ;;
+        2) smtp_host="smtp.163.com"; smtp_port="465"; tls_mode="wrapper" ;;
+        3) smtp_host="smtp.gmail.com"; smtp_port="587"; tls_mode="starttls" ;;
+        4)
+            read -p "SMTP 服务器地址: " smtp_host
+            read -p "SMTP 端口: " smtp_port
+            read -p "TLS 模式（wrapper/starttls）[wrapper]: " tls_mode
+            tls_mode=${tls_mode:-wrapper}
+            ;;
+        *) smtp_host="smtp.qq.com"; smtp_port="465"; tls_mode="wrapper" ;;
+    esac
+
+    local smtp_user smtp_pass
+    read -p "SMTP 登录账号 [${from_addr}]: " smtp_user
+    smtp_user=${smtp_user:-$from_addr}
+    echo -n "SMTP 密码/授权码（输入不回显）: "
+    read -r -s smtp_pass
+    echo
+    [[ -z "$smtp_pass" ]] && { log_error "密码不能为空"; return 1; }
+
+    # 安装 SASL 模块
+    apt-get install -y libsasl2-modules >/dev/null 2>&1
+
+    # 配置 postfix
+    log_step "配置 postfix..."
+    backup_file "/etc/postfix/main.cf"
+
+    postconf -e "relayhost = [${smtp_host}]:${smtp_port}"
+    postconf -e "smtp_sasl_auth_enable = yes"
+    postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
+    postconf -e "smtp_sasl_security_options = noanonymous"
+    postconf -e "smtp_use_tls = yes"
+
+    if [[ "$tls_mode" == "wrapper" ]]; then
+        postconf -e "smtp_tls_wrappermode = yes"
+        postconf -e "smtp_tls_security_level = encrypt"
+    else
+        postconf -e "smtp_tls_wrappermode = no"
+        postconf -e "smtp_tls_security_level = may"
+    fi
+
+    # 写入 SASL 密码文件
+    echo "[${smtp_host}]:${smtp_port} ${smtp_user}:${smtp_pass}" > /etc/postfix/sasl_passwd
+    chmod 600 /etc/postfix/sasl_passwd
+    postmap /etc/postfix/sasl_passwd
+
+    # 配置发件人/收件人
+    postconf -e "sender_canonical_maps = regexp:/etc/postfix/sender_canonical"
+    echo "/.*/ ${from_addr}" > /etc/postfix/sender_canonical
+
+    # 设置 PVE 数据中心邮件
+    pvesh set /cluster/notifications/targets/default-sendmail --mailto "$root_addr" 2>/dev/null || true
+
+    # 重载 postfix
+    systemctl reload postfix
+    log_success "postfix 配置完成"
+
+    # 测试发送
+    read -p "是否发送测试邮件？(y/N): " test_choice
+    if [[ "$test_choice" =~ ^[Yy]$ ]]; then
+        echo "PVE-K 邮件测试：如果你收到，说明 SMTP 中继已可用。" | mail -s "PVE-K 邮件测试" "$root_addr"
+        log_info "测试邮件已提交发送队列（请检查收件箱与垃圾箱）"
+    fi
+
+    log_success "邮件通知配置完成"
+}
+
+# ============ 13. 内核管理 ============
+kernel_management_menu() {
+    while true; do
+        clear
+        echo -e "${H1}═════════════════════════════════════════════════${NC}"
+        echo -e "${H1}         内核管理${NC}"
+        echo -e "${UI_BORDER}"
+        echo -e "${CYAN}  1. 显示当前内核信息${NC}"
+        echo -e "${CYAN}  2. 查看可用内核列表${NC}"
+        echo -e "${CYAN}  3. 安装新内核${NC}"
+        echo -e "${CYAN}  4. 设置默认启动内核${NC}"
+        echo -e "${CYAN}  5. 清理旧内核${NC}"
+        echo -e "${CYAN}  6. 重启系统${NC}"
+        echo -e "${CYAN}  0. 返回主菜单${NC}"
+        echo -e "${UI_BORDER}"
+        read -p "请选择 [0-6]: " choice
+        case "$choice" in
+            1)
+                log_info "当前内核: $(uname -r) ($(uname -m))"
+                echo "已安装的内核:"
+                dpkg -l 2>/dev/null | awk '$2 ~ /^(pve-kernel|proxmox-kernel)-[0-9].*-pve/ && $1 ~ /^(ii|hi)$/ {print "  • " $2}' | sort -V
+                ;;
+            2)
+                log_info "正在获取可用内核列表..."
+                apt-get update >/dev/null 2>&1
+                local available=$(apt-cache search --names-only '^pve-kernel-.*' 2>/dev/null | awk '{print $1}' | sort -V)
+                if [[ -z "$available" ]]; then
+                    available=$(apt-cache search --names-only '^proxmox-kernel-.*' 2>/dev/null | awk '{print $1}' | sort -V)
+                fi
+                if [[ -n "$available" ]]; then
+                    echo "$available" | while read -r k; do echo "  • $k"; done
+                else
+                    log_warn "无法获取可用内核列表，请检查软件源"
+                fi
+                ;;
+            3)
+                read -p "请输入要安装的内核版本（如 proxmox-kernel-6.8.12-1-pve）: " kernel_ver
+                if [[ -n "$kernel_ver" ]]; then
+                    apt-get install -y "$kernel_ver" && log_success "内核安装成功" || log_error "内核安装失败"
+                    update-grub
+                fi
+                ;;
+            4)
+                read -p "请输入要设为默认的内核版本（如 6.8.12-1-pve）: " kernel_ver
+                if [[ -n "$kernel_ver" ]]; then
+                    if [[ -f "/boot/vmlinuz-${kernel_ver}" ]]; then
+                        grub-set-default "gnulinux-advanced-*/gnulinux-${kernel_ver}-advanced-*" 2>/dev/null && \
+                            log_success "默认内核已设置" || log_warn "设置失败，请手动检查"
+                        update-grub
+                    else
+                        log_error "内核文件不存在: /boot/vmlinuz-${kernel_ver}"
+                    fi
+                fi
+                ;;
+            5)
+                remove_kernel
+                ;;
+            6)
+                read -p "确认重启系统？(y/N): " reboot_confirm
+                if [[ "$reboot_confirm" =~ ^[Yy]$ ]]; then
+                    log_info "5秒后重启，按 Ctrl+C 取消..."
+                    sleep 5 && reboot
+                fi
+                ;;
+            0) break ;;
+            *) log_warn "无效选择" ;;
+        esac
+        pause
+    done
+}
+
+# ============ 14. 核显虚拟化 ============
+igpu_menu() {
+    while true; do
+        clear
+        echo -e "${H1}═════════════════════════════════════════════════${NC}"
+        echo -e "${H1}         Intel 核显虚拟化管理${NC}"
+        echo -e "${UI_BORDER}"
+        echo -e "${CYAN}  1. Intel 11-15代 SR-IOV 配置${NC}"
+        echo -e "${CYAN}  2. Intel 6-10代 GVT-g 配置${NC}"
+        echo -e "${CYAN}  3. 验证核显虚拟化状态${NC}"
+        echo -e "${CYAN}  4. 清理核显虚拟化配置${NC}"
+        echo -e "${CYAN}  0. 返回主菜单${NC}"
+        echo -e "${UI_BORDER}"
+        read -p "请选择 [0-4]: " choice
+        case "$choice" in
+            1) igpu_sriov_setup ;;
+            2) igpu_gvtg_setup ;;
+            3) igpu_verify ;;
+            4) igpu_restore ;;
+            0) break ;;
+            *) log_warn "无效选择" ;;
+        esac
+        pause
+    done
+}
+
+grub_add_param() {
+    local param="$1"
+    [[ -z "$param" ]] && return 1
+    backup_file "/etc/default/grub"
+    local current_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub)
+    [[ -z "$current_line" ]] && { log_error "未找到 GRUB_CMDLINE_LINUX_DEFAULT"; return 1; }
+    local current_params=$(echo "$current_line" | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/\1/')
+    local param_key=$(echo "$param" | cut -d'=' -f1)
+    if echo "$current_params" | grep -qw "$param_key"; then
+        current_params=$(echo "$current_params" | sed "s/\b${param_key}[^ ]*\b//g")
+    fi
+    local new_params=$(echo "$current_params $param" | sed 's/  */ /g' | sed 's/^ //;s/ $//')
+    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$new_params\"|" /etc/default/grub
+    log_success "GRUB 参数已添加: $param"
+}
+
+grub_remove_param() {
+    local param="$1"
+    [[ -z "$param" ]] && return 1
+    backup_file "/etc/default/grub"
+    local current_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub)
+    [[ -z "$current_line" ]] && { log_error "未找到 GRUB_CMDLINE_LINUX_DEFAULT"; return 1; }
+    local current_params=$(echo "$current_line" | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/\1/')
+    local param_key=$(echo "$param" | cut -d'=' -f1)
+    local new_params=$(echo "$current_params" | sed "s/\b${param_key}[^ ]*\b//g" | sed 's/  */ /g' | sed 's/^ //;s/ $//')
+    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$new_params\"|" /etc/default/grub
+    log_success "GRUB 参数已删除: $param"
+}
+
+igpu_sriov_setup() {
+    log_step "配置 Intel 11-15代 SR-IOV 核显虚拟化"
+    log_warn "此操作属于高危操作，配置错误可能导致系统无法启动！"
+    read -p "输入 'yes' 确认继续: " -r
+    [[ "$REPLY" != "yes" ]] && { log_info "已取消"; return; }
+
+    # 检查内核版本
+    local kernel_major=$(uname -r | cut -d'.' -f1)
+    local kernel_minor=$(uname -r | cut -d'.' -f2)
+    if [ "$kernel_major" -lt 6 ] || ([ "$kernel_major" -eq 6 ] && [ "$kernel_minor" -lt 8 ]); then
+        log_error "SR-IOV 需要内核 6.8+，当前: $(uname -r)"
+        return 1
+    fi
+    log_success "内核版本检查通过: $(uname -r)"
+
+    # 安装依赖
+    apt-get update
+    apt-get install -y "pve-headers-$(uname -r)" build-essential dkms sysfsutils
+
+    # 配置 GRUB
+    grub_remove_param "i915.enable_gvt"
+    grub_remove_param "pcie_acs_override"
+    grub_add_param "intel_iommu=on"
+    grub_add_param "iommu=pt"
+    grub_add_param "i915.enable_guc=3"
+    grub_add_param "i915.max_vfs=7"
+    grub_add_param "module_blacklist=xe"
+    update-grub
+
+    # 配置内核模块
+    for module in vfio vfio_iommu_type1 vfio_pci vfio_virqfd; do
+        grep -q "^$module$" /etc/modules || echo "$module" >> /etc/modules
+    done
+    sed -i '/^kvmgt$/d' /etc/modules
+    # 清理 i915 黑名单
+    for f in /etc/modprobe.d/blacklist.conf /etc/modprobe.d/pve-blacklist.conf; do
+        [[ -f "$f" ]] && sed -i '/blacklist i915/d;/blacklist snd_hda_intel/d;/blacklist snd_hda_codec_hdmi/d' "$f"
+    done
+    update-initramfs -u -k all
+
+    # 下载 i915-sriov-dkms
+    local dkms_ver="2025.11.10"
+    read -p "请输入 i915-sriov-dkms 版本 [默认: ${dkms_ver}]: " input_ver
+    dkms_ver=${input_ver:-$dkms_ver}
+    local deb_url="https://github.com/strongtz/i915-sriov-dkms/releases/download/v${dkms_ver}/i915-sriov-dkms_${dkms_ver}_amd64.deb"
+    log_info "下载 i915-sriov-dkms v${dkms_ver}..."
+    wget -O /tmp/i915-sriov-dkms.deb "$deb_url" && dpkg -i /tmp/i915-sriov-dkms.deb || log_error "驱动安装失败"
+    rm -f /tmp/i915-sriov-dkms.deb
+
+    log_success "SR-IOV 配置完成，请重启系统生效"
+    log_warn "物理核显 (00:02.0) 不能直通，否则所有虚拟核显将消失"
+}
+
+igpu_gvtg_setup() {
+    log_step "配置 Intel 6-10代 GVT-g 核显虚拟化"
+    log_warn "此操作会修改 GRUB 和内核模块配置"
+    read -p "输入 'yes' 确认继续: " -r
+    [[ "$REPLY" != "yes" ]] && { log_info "已取消"; return; }
+
+    grub_remove_param "i915.enable_guc"
+    grub_remove_param "i915.max_vfs"
+    grub_remove_param "module_blacklist=xe"
+    grub_add_param "intel_iommu=on"
+    grub_add_param "i915.enable_gvt=1"
+    update-grub
+
+    grep -q "^kvmgt$" /etc/modules || echo "kvmgt" >> /etc/modules
+    for module in vfio vfio_iommu_type1 vfio_pci vfio_virqfd; do
+        grep -q "^$module$" /etc/modules || echo "$module" >> /etc/modules
+    done
+    update-initramfs -u -k all
+    log_success "GVT-g 配置完成，请重启系统生效"
+}
+
+igpu_verify() {
+    log_info "当前内核: $(uname -r)"
+    local grub_params=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="//;s/"$//')
+    echo "GRUB 参数:"
+    echo "$grub_params" | tr ' ' '\n' | while read -r p; do [[ -n "$p" ]] && echo "  • $p"; done
+    echo
+    if echo "$grub_params" | grep -q "i915.enable_guc=3"; then
+        log_success "SR-IOV: 已配置"
+    elif echo "$grub_params" | grep -q "i915.enable_gvt=1"; then
+        log_success "GVT-g: 已配置"
+    else
+        log_info "核显虚拟化: 未配置"
+    fi
+    # 检查 VFs
+    local vfs=$(ls /sys/bus/pci/devices/0000:00:02.0/virtfn* 2>/dev/null | wc -l)
+    [[ $vfs -gt 0 ]] && log_success "检测到 ${vfs} 个虚拟核显(VFs)" || log_info "未检测到虚拟核显"
+}
+
+igpu_restore() {
+    log_step "清理核显虚拟化配置"
+    read -p "输入 'yes' 确认: " -r
+    [[ "$REPLY" != "yes" ]] && return
+    grub_remove_param "i915.enable_guc"
+    grub_remove_param "i915.max_vfs"
+    grub_remove_param "i915.enable_gvt"
+    grub_remove_param "module_blacklist=xe"
+    grub_remove_param "iommu=pt"
+    sed -i '/^kvmgt$/d' /etc/modules
+    update-grub
+    update-initramfs -u -k all
+    log_success "核显虚拟化配置已清理，请重启系统"
+}
+
+# ============ 15. RDM 磁盘直通 ============
+rdm_menu() {
+    while true; do
+        clear
+        echo -e "${H1}═════════════════════════════════════════════════${NC}"
+        echo -e "${H1}         RDM 磁盘直通${NC}"
+        echo -e "${UI_BORDER}"
+        echo -e "${CYAN}  1. 查看可直通磁盘${NC}"
+        echo -e "${CYAN}  2. 添加单盘直通${NC}"
+        echo -e "${CYAN}  3. 取消单盘直通${NC}"
+        echo -e "${CYAN}  0. 返回主菜单${NC}"
+        echo -e "${UI_BORDER}"
+        read -p "请选择 [0-3]: " choice
+        case "$choice" in
+            1) rdm_list_disks ;;
+            2) rdm_attach ;;
+            3) rdm_detach ;;
+            0) break ;;
+            *) log_warn "无效选择" ;;
+        esac
+        pause
+    done
+}
+
+rdm_list_disks() {
+    log_info "可直通磁盘列表："
+    local byid_dir="/dev/disk/by-id"
+    if [[ ! -d "$byid_dir" ]]; then
+        log_error "未找到 $byid_dir"
+        return 1
+    fi
+    local idx=0
+    for link in $(find "$byid_dir" -maxdepth 1 -type l 2>/dev/null | sort); do
+        local base=$(basename "$link")
+        [[ "$base" =~ -part[0-9]+$ ]] && continue
+        local real_dev=$(readlink -f "$link" 2>/dev/null)
+        [[ -z "$real_dev" || ! -b "$real_dev" ]] && continue
+        local dev_type=$(lsblk -dn -o TYPE "$real_dev" 2>/dev/null | head -1)
+        [[ "$dev_type" != "disk" ]] && continue
+        # 跳过 DM/LVM
+        [[ "$real_dev" == /dev/mapper/* || "$(basename "$real_dev")" == dm-* ]] && continue
+        local size=$(lsblk -dn -o SIZE "$real_dev" 2>/dev/null | head -1)
+        local model=$(lsblk -dn -o MODEL "$real_dev" 2>/dev/null | head -1)
+        echo "  [$idx] $base -> $real_dev  ${size:-?}  ${model:-?}"
+        idx=$((idx + 1))
+    done
+    [[ $idx -eq 0 ]] && log_warn "未发现可直通磁盘"
+}
+
+rdm_attach() {
+    rdm_list_disks
+    read -p "请输入磁盘 by-id 路径（如 /dev/disk/by-id/ata-XXX）: " id_path
+    [[ -z "$id_path" || ! -e "$id_path" ]] && { log_error "无效路径"; return 1; }
+    read -p "请输入目标 VMID: " vmid
+    [[ -z "$vmid" || ! "$vmid" =~ ^[0-9]+$ ]] && { log_error "无效 VMID"; return 1; }
+    read -p "总线类型 (scsi/sata/ide) [scsi]: " bus
+    bus=${bus:-scsi}
+    # 查找可用插槽
+    local slot=""
+    local max_idx=30
+    [[ "$bus" == "sata" ]] && max_idx=5
+    [[ "$bus" == "ide" ]] && max_idx=3
+    local cfg=$(qm config "$vmid" 2>/dev/null)
+    [[ -z "$cfg" ]] && { log_error "无法读取 VM $vmid 配置"; return 1; }
+    for ((i=0; i<=max_idx; i++)); do
+        if ! echo "$cfg" | grep -qE "^${bus}${i}:"; then
+            slot="${bus}${i}"
+            break
+        fi
+    done
+    [[ -z "$slot" ]] && { log_error "无可用 $bus 插槽"; return 1; }
+    log_info "将直通: $id_path -> VM $vmid ($slot)"
+    backup_file "$(qm config "$vmid" 2>/dev/null | head -1 || echo /etc/pve/qemu-server/${vmid}.conf)"
+    if qm set "$vmid" "-$slot" "$id_path" 2>/dev/null; then
+        log_success "直通配置已写入 VM $vmid ($slot)"
+    else
+        log_error "qm set 执行失败，请检查磁盘是否被占用"
+    fi
+}
+
+rdm_detach() {
+    read -p "请输入目标 VMID: " vmid
+    [[ -z "$vmid" || ! "$vmid" =~ ^[0-9]+$ ]] && { log_error "无效 VMID"; return 1; }
+    echo "当前 VM $vmid 磁盘配置:"
+    qm config "$vmid" 2>/dev/null | grep -E '^(scsi|sata|ide|virtio)' | nl -w 2 -s '. '
+    read -p "请输入要移除的插槽（如 scsi1）: " slot
+    [[ -z "$slot" ]] && { log_error "未输入插槽"; return 1; }
+    if qm set "$vmid" -delete "$slot" 2>/dev/null; then
+        log_success "已移除 VM $vmid 的 $slot"
+    else
+        log_error "移除失败，请检查插槽名是否正确"
+    fi
+}
+
+# ============ 16. GRUB 参数管理 ============
+grub_menu() {
+    while true; do
+        clear
+        echo -e "${H1}═════════════════════════════════════════════════${NC}"
+        echo -e "${H1}         GRUB 参数管理${NC}"
+        echo -e "${UI_BORDER}"
+        echo -e "${CYAN}  1. 查看当前 GRUB 配置${NC}"
+        echo -e "${CYAN}  2. 添加 GRUB 参数${NC}"
+        echo -e "${CYAN}  3. 删除 GRUB 参数${NC}"
+        echo -e "${CYAN}  4. 更新 GRUB${NC}"
+        echo -e "${CYAN}  0. 返回主菜单${NC}"
+        echo -e "${UI_BORDER}"
+        read -p "请选择 [0-4]: " choice
+        case "$choice" in
+            1)
+                log_info "当前 GRUB 参数:"
+                local params=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="//;s/"$//')
+                if [[ -n "$params" ]]; then
+                    echo "$params" | tr ' ' '\n' | while read -r p; do
+                        [[ -n "$p" ]] && echo "  • $p"
+                    done
+                else
+                    log_warn "未找到 GRUB_CMDLINE_LINUX_DEFAULT"
+                fi
+                echo
+                # 关键参数检测
+                echo "关键参数检测:"
+                echo "$params" | grep -q "intel_iommu=on\|amd_iommu=on" && echo "  [OK] IOMMU: 已启用" || echo "  [INFO] IOMMU: 未启用"
+                echo "$params" | grep -q "iommu=pt" && echo "  [OK] 直通优化: 已启用" || echo "  [INFO] 直通优化: 未启用"
+                echo "$params" | grep -q "i915.enable_guc=3" && echo "  [OK] SR-IOV: 已配置" || echo "  [INFO] SR-IOV: 未配置"
+                echo "$params" | grep -q "i915.enable_gvt=1" && echo "  [OK] GVT-g: 已配置" || echo "  [INFO] GVT-g: 未配置"
+                ;;
+            2)
+                read -p "请输入要添加的参数（如 intel_iommu=on）: " param
+                if [[ -n "$param" ]]; then
+                    grub_add_param "$param"
+                    read -p "是否立即更新 GRUB？(Y/n): " upd
+                    [[ "$upd" != "n" ]] && update-grub && log_success "GRUB 已更新"
+                fi
+                ;;
+            3)
+                read -p "请输入要删除的参数键名（如 intel_iommu）: " param
+                if [[ -n "$param" ]]; then
+                    grub_remove_param "$param"
+                    read -p "是否立即更新 GRUB？(Y/n): " upd
+                    [[ "$upd" != "n" ]] && update-grub && log_success "GRUB 已更新"
+                fi
+                ;;
+            4)
+                update-grub && log_success "GRUB 更新完成" || log_error "GRUB 更新失败"
+                ;;
+            0) break ;;
+            *) log_warn "无效选择" ;;
+        esac
+        pause
+    done
+}
+
 # ============ 主菜单 ============
 menu() {
     while :; do
@@ -852,6 +1380,13 @@ menu() {
         echo -e "${CYAN}  7. PVE7/8 添加 ceph-quincy 源${NC}"
         echo -e "${CYAN}  8. 一键卸载 ceph${NC}"
         echo -e "${CYAN}  9. 一键卸载旧内核 (危险!)${NC}"
+        echo -e "${CYAN}  10. 合并 local 存储${NC}"
+        echo -e "${CYAN}  11. 删除 Swap 扩容系统分区${NC}"
+        echo -e "${CYAN}  12. 邮件通知配置 (SMTP)${NC}"
+        echo -e "${CYAN}  13. 内核管理${NC}"
+        echo -e "${CYAN}  14. 核显虚拟化 (SR-IOV/GVT-g)${NC}"
+        echo -e "${CYAN}  15. RDM 磁盘直通${NC}"
+        echo -e "${CYAN}  16. GRUB 参数管理${NC}"
         echo -e "${CYAN}  0. 退出${NC}"
         echo -e "${UI_BORDER}"
         echo -ne " 请选择: [ ]\b\b"
@@ -867,6 +1402,13 @@ menu() {
             7) pve8_ceph ; pause ;;
             8) remove_ceph ; pause ;;
             9) remove_kernel ; pause ;;
+            10) merge_local_storage ; pause ;;
+            11) remove_swap ; pause ;;
+            12) pve_mail_setup ; pause ;;
+            13) kernel_management_menu ;;
+            14) igpu_menu ;;
+            15) rdm_menu ;;
+            16) grub_menu ;;
             0) clear; exit 0 ;;
             *) log_warn "无效选项"; pause ;;
         esac
