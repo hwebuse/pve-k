@@ -173,7 +173,7 @@ enable_pass() {
     if [ $(grep -c "$iommu" /etc/default/grub) = 0 ]; then
         sed -i "s|quiet|quiet $iommu|" /etc/default/grub
         update-grub
-        if [ $(grep -c "vfio" /etc/modules) = 0 ]; then
+        if [ $(grep -c "vfio_iommu_type1" /etc/modules) = 0 ]; then
             cat <<-EOF >> /etc/modules
 vfio
 vfio_iommu_type1
@@ -188,7 +188,15 @@ EOF
             echo "blacklist i915" >> /etc/modprobe.d/blacklist.conf
         fi
         if [ ! -f "/etc/modprobe.d/vfio.conf" ]; then
-            echo "options vfio-pci ids=8086:3185" >> /etc/modprobe.d/vfio.conf
+            log_warn "注意: vfio.conf 中的 PCI ID 需根据实际显卡修改"
+            local gpu_id=$(lspci -n | grep -iE 'vga|display' | head -1 | grep -oE '[0-9a-f]{4}:[0-9a-f]{4}')
+            if [[ -n "$gpu_id" ]]; then
+                echo "options vfio-pci ids=${gpu_id}" >> /etc/modprobe.d/vfio.conf
+                log_info "自动检测到显卡 PCI ID: ${gpu_id}"
+            else
+                echo "options vfio-pci ids=8086:3185" >> /etc/modprobe.d/vfio.conf
+                log_warn "未检测到显卡，使用默认 ID (8086:3185)，请手动修改 /etc/modprobe.d/vfio.conf"
+            fi
         fi
         log_success "开启设置完成，请稍后重启系统。"
     else
@@ -379,11 +387,11 @@ cpu_add() {
         log_success "已启用 UPS 监控"
     else
         log_info "已跳过 UPS 监控"
+        nut_ups_name=""
     fi
 
     # 生成 Nodes.pm 变量
-    tmpf=tmpfile.temp
-    touch $tmpf
+    tmpf=$(mktemp /tmp/pve-k-nodes.XXXXXX)
     cat > $tmpf << 'EOF'
 #modbyshowtempfreq
         $res->{thermalstate} = `sensors -A`;
@@ -392,6 +400,14 @@ cpu_add() {
         my $powermode = `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor && turbostat -S -q -s PkgWatt -i 0.1 -n 1 -c package | grep -v PkgWatt`;
         $res->{cpupower} = $powermode;
 EOF
+
+    # UPS 代码注入（仅在启用时）
+    if [[ "$enable_ups" == "true" ]]; then
+        cat >> $tmpf << EOF
+        my \$ups_status = \`upsc $nut_ups_name 2>/dev/null\`;
+        \$res->{ups_status} = \$ups_status;
+EOF
+    fi
 
     for i in {0..9}; do
         for dev in "/dev/nvme${i}" "/dev/nvme${i}n1"; do
@@ -408,13 +424,17 @@ EOF
     done
 
     ln=$(sed -n -e '/PVE::pvecfg::version_text/=' $nodes | head -1)
+    if [[ -z "$ln" ]]; then
+        log_error "未在 Nodes.pm 中找到 PVE::pvecfg::version_text，插入失败"
+        rm $tmpf
+        return 1
+    fi
     ln=$((ln + 1))
     sed -i "${ln}r $tmpf" $nodes
     rm $tmpf
 
     # 生成 pvemanagerlib.js 渲染器
-    tmpf=tmpfile.temp
-    touch $tmpf
+    tmpf=$(mktemp /tmp/pve-k-js.XXXXXX)
     cat > $tmpf << 'EOF'
 //modbyshowtempfreq
     {
@@ -430,10 +450,11 @@ EOF
           itemId: 'MHz', colspan: 2, printBar: false,
           title: gettext('CPU频率'), textField: 'cpusensors',
           renderer:function(value){
-              const f0 = value.match(/cpu MHz.*?([\d]+)/)[1];
-              const f1 = value.match(/CPU min MHz.*?([\d]+)/)[1];
-              const f2 = value.match(/CPU max MHz.*?([\d]+)/)[1];
-              return `CPU实时: <strong>${f0} MHz</strong> | 最小: ${f1} MHz | 最大: ${f2} MHz`;
+              const m0 = value.match(/cpu MHz.*?([\d]+)/);
+              const m1 = value.match(/CPU min MHz.*?([\d]+)/);
+              const m2 = value.match(/CPU max MHz.*?([\d]+)/);
+              if (!m0 || !m1 || !m2) return '无法获取CPU频率信息';
+              return `CPU实时: <strong>${m0[1]} MHz</strong> | 最小: ${m1[1]} MHz | 最大: ${m2[1]} MHz`;
            }
     },
     {
@@ -497,6 +518,46 @@ EOF
           }
     },
 EOF
+
+    # UPS 渲染器（仅在启用时注入）
+    if [[ "$enable_ups" == "true" ]]; then
+        cat >> $tmpf << 'EOF'
+    {
+          itemId: 'ups-status', colspan: 2, printBar: false,
+          title: gettext('UPS状态'), textField: 'ups_status',
+          renderer: function(value) {
+              if (!value || value.trim() === '') return '<span style="color:#e74c3c">未检测到UPS设备</span>';
+              const lines = value.trim().split('\n');
+              let output = '';
+              let battery = '', status = '', load = '', runtime = '', model = '';
+              for (const line of lines) {
+                  if (line.match(/device\.model:/)) model = line.replace(/.*:\s*/, '');
+                  if (line.match(/battery\.charge:/)) battery = line.replace(/.*:\s*/, '').replace('%', '');
+                  if (line.match(/ups\.status:/)) status = line.replace(/.*:\s*/, '');
+                  if (line.match(/ups\.load:/)) load = line.replace(/.*:\s*/, '').replace('%', '');
+                  if (line.match(/battery\.runtime:/)) runtime = line.replace(/.*:\s*/, '');
+              }
+              if (model) output += `<strong>${model}</strong> | `;
+              if (status) {
+                  if (status.match(/OL/)) output += '<span style="color:#27ae60">市电供电</span>';
+                  else if (status.match(/OB/)) output += '<span style="color:#e74c3c">电池供电</span>';
+                  else output += status;
+              }
+              if (battery) {
+                  let bNum = Number(battery);
+                  let bColor = bNum >= 60 ? '#27ae60' : (bNum >= 30 ? '#f39c12' : '#e74c3c');
+                  output += ` | 电量: <span style="color:${bColor};font-weight:600">${battery}%</span>`;
+              }
+              if (load) output += ` | 负载: ${load}%`;
+              if (runtime) {
+                  let mins = Math.floor(Number(runtime) / 60);
+                  output += ` | 剩余: ${mins}分钟`;
+              }
+              return output || value;
+          }
+    },
+EOF
+    fi
 
     for i in {0..9}; do
         for dev in "/dev/nvme${i}" "/dev/nvme${i}n1"; do
@@ -735,11 +796,12 @@ cpu_del() {
     pvever=$(pveversion | awk -F"/" '{print $2}')
     log_info "PVE 版本: $pvever"
     if [ -f "$nodes.$pvever.bak" ]; then
-        rm -f $nodes $pvemanagerlib $proxmoxlib
-        mv $nodes.$pvever.bak $nodes
-        mv $pvemanagerlib.$pvever.bak $pvemanagerlib
-        mv $proxmoxlib.$pvever.bak $proxmoxlib
-        log_success "已删除监控，请刷新浏览器缓存 (Shift+F5)"
+        cp "$nodes.$pvever.bak" "$nodes" && \
+        cp "$pvemanagerlib.$pvever.bak" "$pvemanagerlib" && \
+        cp "$proxmoxlib.$pvever.bak" "$proxmoxlib" && \
+        rm -f "$nodes.$pvever.bak" "$pvemanagerlib.$pvever.bak" "$proxmoxlib.$pvever.bak" && \
+        log_success "已删除监控，请刷新浏览器缓存 (Shift+F5)" || \
+        log_error "恢复失败，请手动检查备份文件"
     else
         log_warn "你没有添加过监控，退出脚本。"
     fi
@@ -801,7 +863,7 @@ remove_ceph() {
 remove_kernel() {
     log_warn "此操作非常危险，风险自行承担！"
     current_kernel=$(uname -r)
-    available_kernels=$(dpkg --list | grep 'kernel-.*-pve' | awk '{print $2}' | grep -v "$current_kernel" | sort -V)
+    available_kernels=$(dpkg --list | grep -E '^(pve|proxmox)-kernel-.*-pve' | awk '{print $2}' | grep -v "$current_kernel" | sort -V)
     if [ -z "$available_kernels" ]; then
         log_success "未检测到旧内核，当前内核: ${current_kernel}"
         return
@@ -854,7 +916,12 @@ merge_local_storage() {
     log_info "正在扩容 local 分区..."
     lvextend -l +100%FREE /dev/pve/root
     log_info "正在扩展文件系统..."
-    resize2fs /dev/pve/root
+    local fstype=$(findmnt -n -o FSTYPE /dev/pve/root 2>/dev/null || echo "ext4")
+    if [[ "$fstype" == "xfs" ]]; then
+        xfs_growfs / 2>/dev/null || log_warn "xfs_growfs 失败，请手动执行 xfs_growfs /"
+    else
+        resize2fs /dev/pve/root 2>/dev/null || log_warn "resize2fs 失败，请手动执行 resize2fs /dev/pve/root"
+    fi
     log_success "存储合并完成！"
     log_warn "请在 Web UI 中删除 local-lvm 存储配置，并编辑 local 存储勾选所有内容类型"
 }
@@ -882,7 +949,12 @@ remove_swap() {
     log_info "正在扩展系统分区..."
     lvextend -l +100%FREE /dev/mapper/pve-root
     log_info "正在扩展文件系统..."
-    resize2fs /dev/mapper/pve-root
+    local fstype=$(findmnt -n -o FSTYPE /dev/mapper/pve-root 2>/dev/null || echo "ext4")
+    if [[ "$fstype" == "xfs" ]]; then
+        xfs_growfs / 2>/dev/null || log_warn "xfs_growfs 失败，请手动执行 xfs_growfs /"
+    else
+        resize2fs /dev/mapper/pve-root 2>/dev/null || log_warn "resize2fs 失败，请手动执行 resize2fs /dev/mapper/pve-root"
+    fi
     log_success "Swap 删除完成！系统空间更宽裕了"
 }
 
@@ -1283,7 +1355,7 @@ rdm_attach() {
     done
     [[ -z "$slot" ]] && { log_error "无可用 $bus 插槽"; return 1; }
     log_info "将直通: $id_path -> VM $vmid ($slot)"
-    backup_file "$(qm config "$vmid" 2>/dev/null | head -1 || echo /etc/pve/qemu-server/${vmid}.conf)"
+    backup_file "/etc/pve/qemu-server/${vmid}.conf"
     if qm set "$vmid" "-$slot" "$id_path" 2>/dev/null; then
         log_success "直通配置已写入 VM $vmid ($slot)"
     else
