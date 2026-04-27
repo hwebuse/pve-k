@@ -1,14 +1,14 @@
 #!/bin/bash
 # =============================================================================
-# PVE-K 硬件监控增强脚本 v2.0
+# PVE-K 全能优化脚本 v2.0
 # 融合: xiangfeidexiaohuo/pve-diy (详细硬件信息)
-#       Mapleawaa/PVE-Tools-9 (彩色UI/温度阈值/安全机制/UPS)
-# 功能: CPU频率/功耗/温度、NVMe/SATA详细状态、UPS、去除订阅弹窗
+#       Mapleawaa/PVE-Tools-9 (彩色UI/温度阈值/安全机制)
+# 功能: 换源/去弹窗/直通/CPU电源/温度监控/ceph/内核管理
 # =============================================================================
 
 VERSION="2.0.0"
 
-# ============ 颜色与 UI 系统 (源自 PVE-Tools-9) ============
+# ============ 颜色与 UI 系统 ============
 setup_colors() {
     if [[ -t 1 && -z "${NO_COLOR}" ]]; then
         RED=$(printf '\033[0;31m')
@@ -20,15 +20,12 @@ setup_colors() {
         WHITE=$(printf '\033[1;37m')
         ORANGE=$(printf '\033[0;33m')
         NC=$(printf '\033[0m')
-        PRIMARY="${CYAN}"
         H1=$(printf '\033[1;36m')
-        H2=$(printf '\033[1;37m')
     else
         RED='' ; GREEN='' ; YELLOW='' ; BLUE='' ; CYAN=''
-        MAGENTA='' ; WHITE='' ; ORANGE='' ; NC='' ; PRIMARY='' ; H1='' ; H2=''
+        MAGENTA='' ; WHITE='' ; ORANGE='' ; NC='' ; H1=''
     fi
     UI_BORDER="${NC}═════════════════════════════════════════════════${NC}"
-    UI_DIVIDER="${NC}─────────────────────────────────────────────────${NC}"
 }
 setup_colors
 
@@ -38,32 +35,256 @@ log_error() { local ts=$(date +'%H:%M:%S'); echo -e "${RED}[$ts]${NC} ${RED}ERRO
 log_step()  { local ts=$(date +'%H:%M:%S'); echo -e "${BLUE}[$ts]${NC} ${MAGENTA}STEP${NC}  $1"; }
 log_success(){ local ts=$(date +'%H:%M:%S'); echo -e "${GREEN}[$ts]${NC} ${GREEN}OK${NC}   $1"; }
 
-show_status() {
-    case "$1" in
-        "info")    echo -e "${CYAN}[INFO]${NC} $2" ;;
-        "success") echo -e "${GREEN}[ OK ]${NC} $2" ;;
-        "warning") echo -e "${YELLOW}[WARN]${NC} $2" ;;
-        "error")   echo -e "${RED}[FAIL]${NC} $2" ;;
-        "step")    echo -e "${MAGENTA}[STEP]${NC} $2" ;;
-    esac
-}
-
 pause() {
     read -n 1 -p " 按任意键继续... " input
     [[ -n ${input} ]] && echo
 }
 
-# ============ 备份与还原 ============
+# ============ 通用工具 ============
 backup_file() {
     local file="$1"
     local backup_dir="/var/backups/pve-k"
     mkdir -p "$backup_dir"
-    if [[ -f "$file" ]]; then
-        cp "$file" "${backup_dir}/$(basename $file).$(date +%Y%m%d%H%M%S).bak"
+    [[ -f "$file" ]] && cp "$file" "${backup_dir}/$(basename $file).$(date +%Y%m%d%H%M%S).bak"
+}
+
+get_debian_ver() {
+    local sver=$(cat /etc/debian_version | awk -F"." '{print $1}')
+    case "$sver" in
+        13) echo "trixie" ;;
+        12) echo "bookworm" ;;
+        11) echo "bullseye" ;;
+        10) echo "buster" ;;
+        *) echo "" ;;
+    esac
+}
+
+# ============ 1. 一键优化PVE (换源+去弹窗+密钥) ============
+pve_optimization() {
+    local sver=$(get_debian_ver)
+    if [ -z "$sver" ]; then
+        log_error "您的Debian版本不支持！"
+        return 1
+    fi
+
+    log_step "提示：PVE原配置文件将放入 /etc/apt/backup"
+    mkdir -p /etc/apt/backup
+
+    # apt国内源
+    log_step "更换 apt 国内源..."
+    echo " 1. 清华大学镜像站"
+    echo " 2. 中科大镜像站"
+    read -t 30 -p " 请选择 [默认1]: " aptsource
+    aptsource=${aptsource:-1}
+    [[ -e /etc/apt/sources.list ]] && cp -rf /etc/apt/sources.list /etc/apt/backup/sources.list.bak
+    [[ -e /etc/apt/sources.list.d/debian.sources ]] && mv /etc/apt/sources.list.d/debian.sources /etc/apt/backup/debian.sources.bak
+    case "$aptsource" in
+        1)
+            cat > /etc/apt/sources.list <<-EOF
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver} main contrib non-free non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver}-updates main contrib non-free non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ ${sver}-backports main contrib non-free non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security ${sver}-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        2)
+            cat > /etc/apt/sources.list <<-EOF
+deb https://mirrors.ustc.edu.cn/debian/ ${sver} main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian/ ${sver}-updates main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian/ ${sver}-backports main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian-security/ ${sver}-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        *) log_warn "无效选项，使用默认清华源" ;;
+    esac
+    log_success "apt源更换完成"
+
+    # CT模板源
+    log_step "更换 CT 模板源..."
+    [[ -e /usr/share/perl5/PVE/APLInfo.pm ]] && cp -rf /usr/share/perl5/PVE/APLInfo.pm /etc/apt/backup/APLInfo.pm.bak
+    case "$aptsource" in
+        1) sed -i 's|http://download.proxmox.com|https://mirrors.tuna.tsinghua.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm ;;
+        *) sed -i 's|http://download.proxmox.com|http://mirrors.ustc.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm ;;
+    esac
+    pveam update
+    log_success "CT模板源更换完成"
+
+    # PVE帮助源
+    log_step "更换 PVE 使用帮助源..."
+    [[ ! -d /etc/apt/sources.list.d ]] && mkdir -p /etc/apt/sources.list.d
+    [[ -e /etc/apt/sources.list.d/ceph.sources ]] && mv /etc/apt/sources.list.d/ceph.sources /etc/apt/backup/ceph.sources.bak
+    [[ -e /etc/apt/sources.list.d/ceph.list ]] && mv /etc/apt/sources.list.d/ceph.list /etc/apt/backup/ceph.list.bak
+    [[ -e /etc/apt/sources.list.d/pve-no-subscription.list ]] && cp -rf /etc/apt/sources.list.d/pve-no-subscription.list /etc/apt/backup/pve-no-subscription.list.bak
+    cat > /etc/apt/sources.list.d/pve-no-subscription.list <<-EOF
+deb https://mirrors.tuna.tsinghua.edu.cn/proxmox/debian ${sver} pve-no-subscription
+EOF
+    log_success "使用帮助源更换完成"
+
+    # 关闭企业源
+    log_step "关闭企业源..."
+    if [[ -e /etc/apt/sources.list.d/pve-enterprise.sources ]]; then
+        mv /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/backup/pve-enterprise.sources.bak
+        log_success "企业源 pve-enterprise.sources 已移除"
+    fi
+    if [[ -e /etc/apt/sources.list.d/pve-enterprise.list ]]; then
+        mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/backup/pve-enterprise.list.bak
+        log_success "企业源 pve-enterprise.list 已移除"
+    fi
+
+    # 去除订阅弹窗
+    log_step "移除 Proxmox VE 无有效订阅提示..."
+    local proxmoxlib="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+    cp -rf "$proxmoxlib" "${proxmoxlib}.bak"
+    sed -Ezi.bak "s/(Ext.Msg.show\(\{\s+title: gettext\('No valid sub)/void\(\{ \/\/\1/g" "$proxmoxlib"
+    log_success "已移除订阅提示"
+
+    # 下载GPG密钥
+    log_step "下载 Proxmox VE 源密匙..."
+    [[ -e /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg ]] && mv /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg /etc/apt/backup/proxmox-release-${sver}.gpg.bak
+    wget -q --timeout=5 --tries=1 http://mirrors.tuna.tsinghua.edu.cn/proxmox/debian/proxmox-release-${sver}.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg
+    if [[ $? -ne 0 ]]; then
+        wget -q --timeout=5 --tries=1 https://raw.githubusercontent.com/xiangfeidexiaohuo/pve-diy/master/gpg/proxmox-release-${sver}.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-${sver}.gpg
+    fi
+    log_success "密匙下载完成"
+
+    # 重启服务
+    log_step "重新加载服务、重启web控制台..."
+    systemctl daemon-reload && systemctl restart pveproxy.service
+    log_success "服务重启完成"
+
+    log_info "更新源命令: apt-get update -y"
+    log_info "更新软件包: apt-get upgrade -y"
+    log_info "更新PVE:    apt-get dist-upgrade -y"
+    log_success "一键优化完成！"
+}
+
+# ============ 2. 硬件直通 ============
+enable_pass() {
+    log_step "开启硬件直通..."
+    if [ $(dmesg | grep -ce DMAR -e IOMMU | wc -l) = 0 ]; then
+        log_error "您的硬件不支持直通！"
+        return 1
+    fi
+    if [ $(grep -c Intel /proc/cpuinfo) = 0 ]; then
+        iommu="amd_iommu=on"
+    else
+        iommu="intel_iommu=on"
+    fi
+    if [ $(grep -c "$iommu" /etc/default/grub) = 0 ]; then
+        sed -i "s|quiet|quiet $iommu|" /etc/default/grub
+        update-grub
+        if [ $(grep -c "vfio" /etc/modules) = 0 ]; then
+            cat <<-EOF >> /etc/modules
+vfio
+vfio_iommu_type1
+vfio_pci
+vfio_virqfd
+kvmgt
+EOF
+        fi
+        if [ ! -f "/etc/modprobe.d/blacklist.conf" ]; then
+            echo "blacklist snd_hda_intel" >> /etc/modprobe.d/blacklist.conf
+            echo "blacklist snd_hda_codec_hdmi" >> /etc/modprobe.d/blacklist.conf
+            echo "blacklist i915" >> /etc/modprobe.d/blacklist.conf
+        fi
+        if [ ! -f "/etc/modprobe.d/vfio.conf" ]; then
+            echo "options vfio-pci ids=8086:3185" >> /etc/modprobe.d/vfio.conf
+        fi
+        log_success "开启设置完成，请稍后重启系统。"
+    else
+        log_warn "您已经配置过硬件直通!"
     fi
 }
 
-# ============ 去除订阅弹窗 ============
+disable_pass() {
+    log_step "关闭硬件直通..."
+    if [ $(grep -c Intel /proc/cpuinfo) = 0 ]; then
+        iommu="amd_iommu=on"
+    else
+        iommu="intel_iommu=on"
+    fi
+    if [ $(grep -c "$iommu" /etc/default/grub) = 0 ]; then
+        log_warn "您还没有配置过硬件直通"
+    else
+        sed -i "s/ $iommu//g" /etc/default/grub
+        sed -i '/vfio/d' /etc/modules
+        rm -rf /etc/modprobe.d/blacklist.conf /etc/modprobe.d/vfio.conf
+        update-grub
+        log_success "关闭设置完成，请稍后重启系统。"
+    fi
+}
+
+hw_passth() {
+    while :; do
+        clear
+        echo -e "${H1}═════════════════════════════════════════════════${NC}"
+        echo -e "${H1}         配置硬件直通${NC}"
+        echo -e "${UI_BORDER}"
+        echo -e "${CYAN}  1. 开启硬件直通${NC}"
+        echo -e "${CYAN}  2. 关闭硬件直通${NC}"
+        echo -e "${CYAN}  0. 返回主菜单${NC}"
+        echo -e "${UI_BORDER}"
+        echo -ne " 请选择: [ ]\b\b"
+        read -t 60 hwmenuid
+        hwmenuid=${hwmenuid:-0}
+        case "$hwmenuid" in
+            1) enable_pass ; pause ;;
+            2) disable_pass ; pause ;;
+            0) break ;;
+        esac
+    done
+}
+
+# ============ 3. CPU电源模式 ============
+cpupower_menu() {
+    governors=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors)
+    while :; do
+        clear
+        echo -e "${H1}═════════════════════════════════════════════════${NC}"
+        echo -e "${H1}         设置CPU电源模式${NC}"
+        echo -e "${UI_BORDER}"
+        echo -e "${CYAN}  1. conservative(保守)${NC}"
+        echo -e "${CYAN}  2. ondemand(按需)     [默认]${NC}"
+        echo -e "${CYAN}  3. powersave(节能)${NC}"
+        echo -e "${CYAN}  4. performance(性能)${NC}"
+        echo -e "${CYAN}  5. schedutil(负载)${NC}"
+        echo -e "${CYAN}  6. 恢复系统默认${NC}"
+        echo -e "${CYAN}  0. 返回主菜单${NC}"
+        echo -e "${UI_BORDER}"
+        echo " 你的CPU支持: ${governors}"
+        echo -ne " 请选择: [ ]\b\b"
+        read -t 60 cpupowerid
+        cpupowerid=${cpupowerid:-2}
+        case "$cpupowerid" in
+            1) GOVERNOR="conservative" ;;
+            2) GOVERNOR="ondemand" ;;
+            3) GOVERNOR="powersave" ;;
+            4) GOVERNOR="performance" ;;
+            5) GOVERNOR="schedutil" ;;
+            6) cpupower_del ; pause ; continue ;;
+            0) break ;;
+            *) log_warn "无效选项"; pause ; continue ;;
+        esac
+        if [[ -n $(echo "$governors" | grep -o "$GOVERNOR") ]]; then
+            log_info "选择CPU模式: $GOVERNOR"
+            echo "$GOVERNOR" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null
+            local cmd="sleep 10 && echo '$GOVERNOR' | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null #CPU Power Mode"
+            (crontab -l 2>/dev/null | grep -v "CPU Power Mode"; echo "@reboot $cmd") | crontab -
+            log_success "已设置并添加开机任务"
+        else
+            log_warn "您的CPU不支持该模式！"
+        fi
+        pause
+    done
+}
+
+cpupower_del() {
+    echo "performance" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null
+    crontab -l 2>/dev/null | grep -v "CPU Power Mode" | crontab -
+    log_success "已恢复系统默认电源设置"
+}
+
+# ============ 4/5. CPU/硬盘温度监控 ============
 remove_subscription_popup() {
     local proxmoxlib="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
     if [[ -f "$proxmoxlib" ]]; then
@@ -75,11 +296,9 @@ remove_subscription_popup() {
                 s/(if\s*\([[:space:]]*res\s*===\s*null\s*(\|\|\s*res\s*===\s*undefined\s*)?(\|\|\s*!res\s*)?(\|\|\s*res\.data\.status\.toLowerCase\(\)\s*!==\s*['\''"]active['\''"]\s*)?[[:space:]]*\)\s*\{)/if(false){/
             }
         }' "$proxmoxlib"
-        log_success "已去除订阅弹窗"
     fi
 }
 
-# ============ CPU 添加 / 删除 ============
 cpu_add() {
     nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
     pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
@@ -87,11 +306,9 @@ cpu_add() {
     pvever=$(pveversion | awk -F"/" '{print $2}')
     log_info "PVE 版本: $pvever"
 
-    # 幂等性检测
-    if [ $(grep 'modbyshowtempfreq' $nodes $pvemanagerlib $proxmoxlib 2>/dev/null | wc -l) -eq 3 ]; then
+    if [ $(grep -c 'modbyshowtempfreq' $nodes $pvemanagerlib $proxmoxlib 2>/dev/null) -ge 3 ]; then
         log_warn "已经修改过，请勿重复修改"
-        log_warn "如果没有生效，请使用 Shift+F5 刷新浏览器缓存"
-        log_warn "如果需要强制重新修改，请先执行还原操作"
+        log_warn "如需重新修改，请先执行删除监控"
         pause
         return
     fi
@@ -112,8 +329,7 @@ cpu_add() {
     done
 
     [[ -e /usr/sbin/linux-cpupower ]] && chmod +s /usr/sbin/linux-cpupower
-    chmod +s /usr/sbin/nvme
-    chmod +s /usr/sbin/smartctl
+    chmod +s /usr/sbin/nvme /usr/sbin/smartctl
     chmod +s /usr/sbin/turbostat 2>/dev/null || log_warn "无法设置 turbostat 权限"
     modprobe msr && echo msr > /etc/modules-load.d/turbostat-msr.conf
 
@@ -122,18 +338,18 @@ cpu_add() {
         sensors-detect --auto > /tmp/sensors
         drivers=$(sed -n '/Chip drivers/,/\#----cut here/p' /tmp/sensors | sed '/Chip /d' | sed '/cut/d')
         if [ $(echo $drivers | wc -w) = 0 ]; then
-            log_warn "没有找到任何驱动，似乎系统不支持或驱动安装失败。"
+            log_warn "没有找到任何驱动"
             pause
         else
             for i in $drivers; do
                 modprobe $i
-                if [ $(grep $i /etc/modules | wc -l) = 0 ]; then
+                if [ $(grep -c $i /etc/modules) = 0 ]; then
                     echo $i >> /etc/modules
                 fi
             done
             sensors
             sleep 2
-            log_success "驱动信息配置成功。"
+            log_success "驱动信息配置成功"
         fi
         [[ -e /etc/init.d/kmod ]] && /etc/init.d/kmod start
         rm /tmp/sensors
@@ -143,33 +359,29 @@ cpu_add() {
     backup_file "$nodes"
     backup_file "$pvemanagerlib"
     backup_file "$proxmoxlib"
-
-    # 版本备份
     rm -f $nodes.*.bak $pvemanagerlib.*.bak $proxmoxlib.*.bak
     cp $nodes $nodes.$pvever.bak
     cp $pvemanagerlib $pvemanagerlib.$pvever.bak
     cp $proxmoxlib $proxmoxlib.$pvever.bak
 
-    # UPS 选项
-    local enable_ups=false
-    local nut_ups_target=""
+    # UPS选项
     echo -n "是否启用 UPS 监控？(y/N，默认N): "
     read -n 1 -r
     echo
+    local enable_ups=false
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         enable_ups=true
         read -r -p "请输入 NUT UPS 设备名 [默认: ups]: " nut_ups_name
         nut_ups_name=${nut_ups_name:-ups}
-        nut_ups_target="${nut_ups_name}@localhost"
-        log_success "已启用 UPS 监控 (NUT: ${nut_ups_target})"
         if ! dpkg -s nut-client &> /dev/null; then
             apt-get install nut-client -y
         fi
+        log_success "已启用 UPS 监控"
     else
         log_info "已跳过 UPS 监控"
     fi
 
-    # ============ 生成 Nodes.pm 后端变量 ============
+    # 生成 Nodes.pm 变量
     tmpf=tmpfile.temp
     touch $tmpf
     cat > $tmpf << 'EOF'
@@ -181,7 +393,6 @@ cpu_add() {
         $res->{cpupower} = $powermode;
 EOF
 
-    # NVMe 变量（文本模式，兼容 pve-diy 的详细解析）
     for i in {0..9}; do
         for dev in "/dev/nvme${i}" "/dev/nvme${i}n1"; do
             if [ -b "$dev" ]; then
@@ -196,23 +407,19 @@ EOF
         done
     done
 
-    # 注入 Nodes.pm
     ln=$(sed -n -e '/PVE::pvecfg::version_text/=' $nodes | head -1)
     ln=$((ln + 1))
     sed -i "${ln}r $tmpf" $nodes
     rm $tmpf
 
-    # ============ 生成 pvemanagerlib.js 前端渲染器 ============
+    # 生成 pvemanagerlib.js 渲染器
     tmpf=tmpfile.temp
     touch $tmpf
     cat > $tmpf << 'EOF'
 //modbyshowtempfreq
     {
-          itemId: 'CPUW',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU功耗'),
-          textField: 'cpupower',
+          itemId: 'CPUW', colspan: 2, printBar: false,
+          title: gettext('CPU功耗'), textField: 'cpupower',
           renderer:function(value){
               const w0 = value.split('\n')[0].split(' ')[0];
               const w1 = value.split('\n')[1].split(' ')[0];
@@ -220,11 +427,8 @@ EOF
            }
     },
     {
-          itemId: 'MHz',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU频率'),
-          textField: 'cpusensors',
+          itemId: 'MHz', colspan: 2, printBar: false,
+          title: gettext('CPU频率'), textField: 'cpusensors',
           renderer:function(value){
               const f0 = value.match(/cpu MHz.*?([\d]+)/)[1];
               const f1 = value.match(/CPU min MHz.*?([\d]+)/)[1];
@@ -233,17 +437,13 @@ EOF
            }
     },
     {
-          itemId: 'HEXIN',
-          colspan: 2,
-          printBar: false,
-          title: gettext('核心频率'),
-          textField: 'cpusensors',
+          itemId: 'HEXIN', colspan: 2, printBar: false,
+          title: gettext('核心频率'), textField: 'cpusensors',
           renderer: function(value) {
               const freqMatches = value.matchAll(/^cpu MHz\s*:\s*([\d\.]+)/gm);
               const frequencies = [];
               for (const match of freqMatches) {
-                  const coreNum = frequencies.length + 1;
-                  frequencies.push(`核心${coreNum}: <strong>${parseInt(match[1])} MHz</strong>`);
+                  frequencies.push(`核心${frequencies.length + 1}: <strong>${parseInt(match[1])} MHz</strong>`);
               }
               if (frequencies.length === 0) return '无法获取CPU频率信息';
               const groupedFreqs = [];
@@ -254,31 +454,25 @@ EOF
            }
     },
     {
-          itemId: 'thermal',
-          colspan: 2,
-          printBar: false,
-          title: gettext('CPU温度'),
-          textField: 'thermalstate',
+          itemId: 'thermal', colspan: 2, printBar: false,
+          title: gettext('CPU温度'), textField: 'thermalstate',
           renderer: function(value) {
               function colorizeTemp(temp) {
                   let tempNum = Number(temp);
                   if (Number.isNaN(tempNum)) return temp + '°C';
-                  if (tempNum < 60) return '<span style="color:#27ae60; font-weight:600;">' + tempNum.toFixed(0) + '°C</span>';
-                  if (tempNum < 80) return '<span style="color:#f39c12; font-weight:600;">' + tempNum.toFixed(0) + '°C</span>';
-                  return '<span style="color:#e74c3c; font-weight:600;">' + tempNum.toFixed(0) + '°C</span>';
+                  if (tempNum < 60) return '<span style="color:#27ae60;font-weight:600;">' + tempNum.toFixed(0) + '°C</span>';
+                  if (tempNum < 80) return '<span style="color:#f39c12;font-weight:600;">' + tempNum.toFixed(0) + '°C</span>';
+                  return '<span style="color:#e74c3c;font-weight:600;">' + tempNum.toFixed(0) + '°C</span>';
               }
               const coreTemps = [];
               let coreMatch;
               const coreRegex = /(Core\s*\d+|Core\d+|Tdie|Tctl|Physical id\s*\d+).*?\+\s*([\d\.]+)/gi;
               while ((coreMatch = coreRegex.exec(value)) !== null) {
-                  let label = coreMatch[1];
-                  let tempValue = coreMatch[2];
-                  if (label.match(/Tdie|Tctl/i)) {
-                      coreTemps.push(`CPU温度: ${colorizeTemp(tempValue)}`);
-                  } else {
-                      const coreNumberMatch = label.match(/\d+/);
-                      const coreNum = coreNumberMatch ? parseInt(coreNumberMatch[0]) + 1 : 1;
-                      coreTemps.push(`核心${coreNum}: ${colorizeTemp(tempValue)}`);
+                  let label = coreMatch[1], tempValue = coreMatch[2];
+                  if (label.match(/Tdie|Tctl/i)) coreTemps.push(`CPU温度: ${colorizeTemp(tempValue)}`);
+                  else {
+                      const cn = label.match(/\d+/);
+                      coreTemps.push(`核心${cn ? parseInt(cn[0]) + 1 : 1}: ${colorizeTemp(tempValue)}`);
                   }
               }
               let igpuTemp = '';
@@ -286,7 +480,6 @@ EOF
               const amdIgpuMatch = value.match(/(junction|edge).*?\+\s*([\d\.]+)/i);
               if (intelIgpuMatch) igpuTemp = `核显: ${colorizeTemp(intelIgpuMatch[2])}`;
               else if (amdIgpuMatch) igpuTemp = `核显: ${colorizeTemp(amdIgpuMatch[2])}`;
-
               if (coreTemps.length === 0) {
                   const k10tempMatch = value.match(/k10temp-pci-\w+\n[^+]*\+\s*([\d\.]+)/);
                   if (k10tempMatch) coreTemps.push(`CPU温度: ${colorizeTemp(k10tempMatch[1])}`);
@@ -300,42 +493,36 @@ EOF
               const boardTempMatch = value.match(/(?:temp1|motherboard|sys).*?\+\s*([\d\.]+)/i);
               const boardTemp = boardTempMatch ? `主板: ${colorizeTemp(boardTempMatch[1])}` : '';
               const combinedTemps = [igpuTemp, packageTemp, boardTemp].filter(Boolean).join(' | ');
-              const result = [groupedTemps.join('<br>'), combinedTemps].filter(Boolean).join('<br>');
-              return result || '未获取到温度信息';
+              return [groupedTemps.join('<br>'), combinedTemps].filter(Boolean).join('<br>') || '未获取到温度信息';
           }
     },
 EOF
 
-    # NVMe 前端渲染（详细版，含 I/O 实时数据）
     for i in {0..9}; do
         for dev in "/dev/nvme${i}" "/dev/nvme${i}n1"; do
             if [ -b "$dev" ]; then
                 cat >> $tmpf << EOF
     {
-          itemId: 'nvme${i}-status',
-          colspan: 2,
-          printBar: false,
-          title: gettext('NVME盘${i}'),
-          textField: 'nvme${i}_status',
+          itemId: 'nvme${i}-status', colspan: 2, printBar: false,
+          title: gettext('NVME盘${i}'), textField: 'nvme${i}_status',
           renderer:function(value){
               function colorizeTemp(temp) {
                   let tempNum = Number(temp);
                   if (Number.isNaN(tempNum)) return temp + '°C';
-                  if (tempNum < 50) return '<span style="color:#27ae60; font-weight:600;">' + tempNum + '°C</span>';
-                  if (tempNum < 70) return '<span style="color:#f39c12; font-weight:600;">' + tempNum + '°C</span>';
-                  return '<span style="color:#e74c3c; font-weight:600;">' + tempNum + '°C</span>';
+                  if (tempNum < 50) return '<span style="color:#27ae60;font-weight:600;">' + tempNum + '°C</span>';
+                  if (tempNum < 70) return '<span style="color:#f39c12;font-weight:600;">' + tempNum + '°C</span>';
+                  return '<span style="color:#e74c3c;font-weight:600;">' + tempNum + '°C</span>';
               }
               function colorizeHealth(percent) {
                   let healthNum = Number(percent);
                   if (Number.isNaN(healthNum)) return percent + '%';
-                  if (healthNum >= 80) return '<span style="color:#27ae60; font-weight:600;">' + healthNum + '%</span>';
-                  if (healthNum >= 50) return '<span style="color:#f39c12; font-weight:600;">' + healthNum + '%</span>';
-                  return '<span style="color:#e74c3c; font-weight:600;">' + healthNum + '%</span>';
+                  if (healthNum >= 80) return '<span style="color:#27ae60;font-weight:600;">' + healthNum + '%</span>';
+                  if (healthNum >= 50) return '<span style="color:#f39c12;font-weight:600;">' + healthNum + '%</span>';
+                  return '<span style="color:#e74c3c;font-weight:600;">' + healthNum + '%</span>';
               }
               if (value.length > 0) {
                   value = value.replace(/Â/g, '');
-                  let data = [];
-                  let nvmeNumber = -1;
+                  let data = []; let nvmeNumber = -1;
                   let nvmes = value.matchAll(/(^(?:Model|Total|Temperature:|Available Spare:|Percentage|Data|Power|Unsafe|Integrity Errors|nvme)[\s\S]*)+/gm);
                   for (const nvme of nvmes) {
                       if (/Model Number:/.test(nvme[1])) {
@@ -386,27 +573,20 @@ EOF
                               for (const nvmeIntegrity_Error of nvme.Integrity_Errors) {
                                   if (nvmeIntegrity_Error != 0) {
                                       output += \`(<span style='color:#e74c3c'>0E: \${nvmeIntegrity_Error}-故障！</span>\`;
-                                      if (nvme.Available_Spares.length > 0) {
-                                          output += ', 备用空间: ' + nvme.Available_Spares[0];
-                                      }
+                                      if (nvme.Available_Spares.length > 0) output += ', 备用空间: ' + nvme.Available_Spares[0];
                                       output += \`)\`;
                                   }
                               }
                           }
                           output += '<br>';
                       }
-                      if (nvme.Capacitys.length > 0) {
-                          output += \`容量: \${nvme.Capacitys[0].replace(/ |,/gm, '')}\`;
-                      }
+                      if (nvme.Capacitys.length > 0) output += \`容量: \${nvme.Capacitys[0].replace(/ |,/gm, '')}\`;
                       if (nvme.Useds.length > 0) {
-                          output += ' | ';
-                          output += \`寿命: \${colorizeHealth(100-Number(nvme.Useds[0]))}\`;
+                          output += ' | ' + \`寿命: \${colorizeHealth(100-Number(nvme.Useds[0]))}\`;
                           if (nvme.Reads.length > 0) output += \`(已读\${nvme.Reads[0].replace(/ |,/gm, '')})\`;
                           if (nvme.Writtens.length > 0) output += \`(已写\${nvme.Writtens[0].replace(/ |,/gm, '')})\`;
                       }
-                      if (nvme.Temperatures.length > 0) {
-                          output += ' | 温度: ' + colorizeTemp(nvme.Temperatures[0]);
-                      }
+                      if (nvme.Temperatures.length > 0) output += ' | 温度: ' + colorizeTemp(nvme.Temperatures[0]);
                       if (nvme.States.length > 0) {
                           output += '<br>I/O: ';
                           if (nvme.r_kBs.length > 0 || nvme.r_awaits.length > 0) {
@@ -428,8 +608,7 @@ EOF
                           if (nvme.utils.length > 0) output += \`负载\${nvme.utils[0]}%\`;
                       }
                       if (nvme.Cycles.length > 0) {
-                          output += '<br>';
-                          output += \`通电: \${nvme.Cycles[0].replace(/ |,/gm, '')}次\`;
+                          output += '<br>' + \`通电: \${nvme.Cycles[0].replace(/ |,/gm, '')}次\`;
                           if (nvme.Shutdowns.length > 0) output += \`, 不安全断电\${nvme.Shutdowns[0].replace(/ |,/gm, '')}次\`;
                           if (nvme.Hours.length > 0) output += \`, 累计\${nvme.Hours[0].replace(/ |,/gm, '')}小时\`;
                       }
@@ -446,29 +625,24 @@ EOF
         done
     done
 
-    # SATA 前端渲染
     cat >> $tmpf << 'EOF'
     {
-          itemId: 'hdd-temperatures',
-          colspan: 2,
-          printBar: false,
-          title: gettext('SATA盘'),
-          textField: 'hdd_temperatures',
+          itemId: 'hdd-temperatures', colspan: 2, printBar: false,
+          title: gettext('SATA盘'), textField: 'hdd_temperatures',
           renderer: function(value) {
               function colorizeTemp(temp) {
                   let tempNum = Number(temp);
                   if (Number.isNaN(tempNum)) return temp + '°C';
-                  if (tempNum < 40) return '<span style="color:#27ae60; font-weight:600;">' + tempNum + '°C</span>';
-                  if (tempNum < 50) return '<span style="color:#f39c12; font-weight:600;">' + tempNum + '°C</span>';
-                  return '<span style="color:#e74c3c; font-weight:600;">' + tempNum + '°C</span>';
+                  if (tempNum < 40) return '<span style="color:#27ae60;font-weight:600;">' + tempNum + '°C</span>';
+                  if (tempNum < 50) return '<span style="color:#f39c12;font-weight:600;">' + tempNum + '°C</span>';
+                  return '<span style="color:#e74c3c;font-weight:600;">' + tempNum + '°C</span>';
               }
               if (value.length > 0) {
                   try {
                       const jsonData = JSON.parse(value);
                       if (jsonData.standy === true) return '休眠中';
-                      let output = '';
                       if (jsonData.model_name) {
-                          output = `<strong>${jsonData.model_name}</strong><br>`;
+                          let output = `<strong>${jsonData.model_name}</strong><br>`;
                           if (jsonData.temperature?.current !== undefined) output += `温度: ${colorizeTemp(jsonData.temperature.current)}`;
                           if (jsonData.power_on_time?.hours !== undefined) {
                               if (output.length > 0) output += ' | ';
@@ -507,11 +681,10 @@ EOF
                       } else {
                           if (value.match(/\/dev\/sd[a-z]/)) {
                               deviceOutput = `<strong>${devicemodel}</strong><br>容量: ${capacity} | 已通电: ${powerOnHours}小时 | 提示: 设备存在但未报告温度信息`;
-                              outputs.push(deviceOutput);
                           } else {
                               deviceOutput = `<strong>${devicemodel}</strong><br>容量: ${capacity} | 已通电: ${powerOnHours}小时 | 提示: 未检测到温度传感器`;
-                              outputs.push(deviceOutput);
                           }
+                          outputs.push(deviceOutput);
                       }
                   }
                   if (!outputs.length && value.length > 0) {
@@ -532,7 +705,6 @@ EOF
     sed -i "${ln}r $tmpf" $pvemanagerlib
     rm $tmpf
 
-    # 修改页面高度
     log_step "调整页面高度"
     disk_count=$(lsblk -d -o NAME | grep -cE 'sd[a-z]|nvme[0-9]')
     height_increase=$((disk_count * 69))
@@ -542,7 +714,6 @@ EOF
     sed -i -r '/widget\.pveCpuStatus/,+5{/height/{s#[0-9]+#'$cpu_status_new_height'#}}' $pvemanagerlib
     log_info "左栏高度: ${node_status_new_height}px, CPU面板: ${cpu_status_new_height}px"
 
-    # 调整布局右对齐
     ln=$(sed -n -e '/widget.pveDcGuests/=' $pvemanagerlib | head -1)
     ln=$((ln + 10))
     sed -i "${ln}a\        textAlign: 'right'," $pvemanagerlib
@@ -550,7 +721,6 @@ EOF
     ln=$((ln + 10))
     sed -i "${ln}a\        textAlign: 'right'," $pvemanagerlib
 
-    # 去除订阅弹窗
     log_step "去除订阅弹窗"
     remove_subscription_popup
 
@@ -558,7 +728,6 @@ EOF
     log_success "修改完成！请刷新浏览器缓存 (Shift+F5)"
 }
 
-# ============ 删除监控 ============
 cpu_del() {
     nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
     pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
@@ -570,10 +739,101 @@ cpu_del() {
         mv $nodes.$pvever.bak $nodes
         mv $pvemanagerlib.$pvever.bak $pvemanagerlib
         mv $proxmoxlib.$pvever.bak $proxmoxlib
-        log_success "已删除温度显示，请重新刷新浏览器缓存 (Shift+F5)"
+        log_success "已删除监控，请刷新浏览器缓存 (Shift+F5)"
     else
-        log_warn "你没有添加过温度显示，退出脚本。"
+        log_warn "你没有添加过监控，退出脚本。"
     fi
+}
+
+# ============ 6/7. Ceph 源 ============
+pve9_ceph() {
+    local sver=$(get_debian_ver)
+    if [[ "$sver" != "trixie" && "$sver" != "bookworm" ]]; then
+        log_error "ceph-squid 目前仅支持 PVE 8/9"
+        return 1
+    fi
+    log_step "添加 ceph-squid 源..."
+    mkdir -p /etc/apt/backup /etc/apt/sources.list.d
+    [[ -e /etc/apt/sources.list.d/ceph.sources ]] && mv /etc/apt/sources.list.d/ceph.sources /etc/apt/backup/ceph.sources.bak
+    [[ -e /etc/apt/sources.list.d/ceph.list ]] && mv /etc/apt/sources.list.d/ceph.list /etc/apt/backup/ceph.list.bak
+    [[ -e /usr/share/perl5/PVE/CLI/pveceph.pm ]] && cp -rf /usr/share/perl5/PVE/CLI/pveceph.pm /etc/apt/backup/pveceph.pm.bak
+    sed -i 's|http://download.proxmox.com|https://mirrors.tuna.tsinghua.edu.cn/proxmox|g' /usr/share/perl5/PVE/CLI/pveceph.pm
+    cat > /etc/apt/sources.list.d/ceph.list <<-EOF
+deb https://mirrors.tuna.tsinghua.edu.cn/proxmox/debian/ceph-squid ${sver} no-subscription
+EOF
+    log_success "添加 ceph-squid 源完成"
+}
+
+pve8_ceph() {
+    local sver=$(get_debian_ver)
+    if [[ "$sver" != "bookworm" && "$sver" != "bullseye" ]]; then
+        log_error "ceph-quincy 目前仅支持 PVE 7/8"
+        return 1
+    fi
+    log_step "添加 ceph-quincy 源..."
+    mkdir -p /etc/apt/backup /etc/apt/sources.list.d
+    [[ -e /etc/apt/sources.list.d/ceph.sources ]] && mv /etc/apt/sources.list.d/ceph.sources /etc/apt/backup/ceph.sources.bak
+    [[ -e /etc/apt/sources.list.d/ceph.list ]] && mv /etc/apt/sources.list.d/ceph.list /etc/apt/backup/ceph.list.bak
+    [[ -e /usr/share/perl5/PVE/CLI/pveceph.pm ]] && cp -rf /usr/share/perl5/PVE/CLI/pveceph.pm /etc/apt/backup/pveceph.pm.bak
+    sed -i 's|http://download.proxmox.com|https://mirrors.tuna.tsinghua.edu.cn/proxmox|g' /usr/share/perl5/PVE/CLI/pveceph.pm
+    cat > /etc/apt/sources.list.d/ceph.list <<-EOF
+deb https://mirrors.tuna.tsinghua.edu.cn/proxmox/debian/ceph-quincy ${sver} main
+EOF
+    log_success "添加 ceph-quincy 源完成"
+}
+
+remove_ceph() {
+    log_warn "会卸载 ceph，并删除所有 ceph 相关文件！"
+    read -rp "确认继续？(y/n): " confirm
+    [[ "$confirm" != "y" ]] && return
+    systemctl stop ceph-mon.target ceph-mgr.target ceph-mds.target ceph-osd.target
+    rm -rf /etc/systemd/system/ceph*
+    killall -9 ceph-mon ceph-mgr ceph-mds ceph-osd 2>/dev/null
+    rm -rf /var/lib/ceph/mon/* /var/lib/ceph/mgr/* /var/lib/ceph/mds/* /var/lib/ceph/osd/*
+    pveceph purge 2>/dev/null
+    apt purge -y ceph-mon ceph-osd ceph-mgr ceph-mds ceph-base ceph-mgr-modules-core
+    rm -rf /etc/ceph /etc/pve/ceph.conf /etc/pve/priv/ceph.* /var/log/ceph /etc/pve/ceph /var/lib/ceph
+    [[ -e /etc/apt/sources.list.d/ceph.sources ]] && mv /etc/apt/sources.list.d/ceph.sources /etc/apt/backup/ceph.sources.bak
+    log_success "已成功卸载 ceph"
+}
+
+# ============ 9. 卸载旧内核 ============
+remove_kernel() {
+    log_warn "此操作非常危险，风险自行承担！"
+    current_kernel=$(uname -r)
+    available_kernels=$(dpkg --list | grep 'kernel-.*-pve' | awk '{print $2}' | grep -v "$current_kernel" | sort -V)
+    if [ -z "$available_kernels" ]; then
+        log_success "未检测到旧内核，当前内核: ${current_kernel}"
+        return
+    fi
+    echo "可供移除的内核:"
+    echo "$available_kernels" | nl -w 2 -s '. '
+    echo -e "\n选择要删除的内核（以逗号分隔，例如 1,2）:"
+    read -r selected
+    IFS=',' read -r -a selected_indices <<<"$selected"
+    kernels_to_remove=()
+    for index in "${selected_indices[@]}"; do
+        kernel=$(echo "$available_kernels" | sed -n "${index}p")
+        [ -n "$kernel" ] && kernels_to_remove+=("$kernel")
+    done
+    if [ ${#kernels_to_remove[@]} -eq 0 ]; then
+        log_error "未做出有效选择"
+        return
+    fi
+    echo "待移除的内核:"
+    printf "%s\n" "${kernels_to_remove[@]}"
+    read -rp "继续删除吗？(y/n): " confirm
+    [[ "$confirm" != "y" ]] && return
+    for kernel in "${kernels_to_remove[@]}"; do
+        log_step "移除 $kernel..."
+        if apt-get purge -y "$kernel" >/dev/null 2>&1; then
+            log_success "已成功移除: $kernel"
+        else
+            log_error "删除失败: $kernel"
+        fi
+    done
+    apt-get autoremove -y >/dev/null 2>&1 && update-grub >/dev/null 2>&1
+    log_success "清理和 GRUB 更新完成"
 }
 
 # ============ 主菜单 ============
@@ -581,25 +841,38 @@ menu() {
     while :; do
         clear
         echo -e "${H1}═════════════════════════════════════════════════${NC}"
-        echo -e "${H1}         PVE-K 硬件监控增强脚本 v${VERSION}${NC}"
+        echo -e "${H1}         PVE-K 全能优化脚本 v${VERSION}${NC}"
         echo -e "${H1}═════════════════════════════════════════════════${NC}"
-        echo -e "${CYAN}  1. 添加 CPU/硬盘/温度详细监控${NC}"
-        echo -e "${CYAN}  2. 删除监控（恢复官方文件）${NC}"
+        echo -e "${CYAN}  1. 一键优化PVE (换源/去弹窗/密钥)${NC}"
+        echo -e "${CYAN}  2. 配置PCI硬件直通${NC}"
+        echo -e "${CYAN}  3. 设置CPU电源模式${NC}"
+        echo -e "${CYAN}  4. 添加 CPU/硬盘/温度详细监控${NC}"
+        echo -e "${CYAN}  5. 删除监控（恢复官方文件）${NC}"
+        echo -e "${CYAN}  6. PVE8/9 添加 ceph-squid 源${NC}"
+        echo -e "${CYAN}  7. PVE7/8 添加 ceph-quincy 源${NC}"
+        echo -e "${CYAN}  8. 一键卸载 ceph${NC}"
+        echo -e "${CYAN}  9. 一键卸载旧内核 (危险!)${NC}"
         echo -e "${CYAN}  0. 退出${NC}"
         echo -e "${UI_BORDER}"
         echo -ne " 请选择: [ ]\b\b"
         read -t 60 menuid
         menuid=${menuid:-0}
         case ${menuid} in
-            1) cpu_add ; pause ;;
-            2) cpu_del ; pause ;;
+            1) pve_optimization ; pause ;;
+            2) hw_passth ;;
+            3) cpupower_menu ;;
+            4) cpu_add ; pause ;;
+            5) cpu_del ; pause ;;
+            6) pve9_ceph ; pause ;;
+            7) pve8_ceph ; pause ;;
+            8) remove_ceph ; pause ;;
+            9) remove_kernel ; pause ;;
             0) clear; exit 0 ;;
             *) log_warn "无效选项"; pause ;;
         esac
     done
 }
 
-# 检查 root
 if [[ $EUID -ne 0 ]]; then
     log_error "请使用 root 权限运行此脚本"
     exit 1
