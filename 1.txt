@@ -1,5 +1,5 @@
 git add .
 
-git commit -m "更新功能"
+git commit -m "更新"
 
 git push
